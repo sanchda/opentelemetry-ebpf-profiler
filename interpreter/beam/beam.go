@@ -114,14 +114,15 @@ type beamMfa struct {
 type beamInstance struct {
 	interpreter.InstanceStubs
 
-	pid          libpf.PID
-	data         *beamData
-	rm           remotememory.RemoteMemory
-	rangesPtr    libpf.Address
-	atomTable    libpf.Address
-	atomCache    *freelru.LRU[uint32, libpf.String]
-	mfaNameCache *freelru.LRU[beamMfa, libpf.String]
-	stringCache  *freelru.LRU[libpf.Address, libpf.String]
+	pid                libpf.PID
+	data               *beamData
+	rm                 remotememory.RemoteMemory
+	activeCodeIndexPtr libpf.Address
+	rangesPtr          libpf.Address
+	atomTable          libpf.Address
+	atomCache          *freelru.LRU[uint32, libpf.String]
+	mfaNameCache       *freelru.LRU[beamMfa, libpf.String]
+	stringCache        *freelru.LRU[libpf.Address, libpf.String]
 
 	// prefixes is indexed by the prefix added to ebpf maps (to be cleaned up) to its generation
 	prefixes map[lpm.Prefix]uint32
@@ -194,20 +195,6 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		return nil, fmt.Errorf("symbol 'etp_ptr_mask' not found: %v", err)
 	}
 
-	// "etp_header_subtag_mask" is from:
-	// https://github.com/erlang/otp/blob/OTP-28.0.2/erts/emulator/beam/erl_etp.c#L132
-	_, etpHeaderSubtagMask, err := ef.SymbolData("etp_header_subtag_mask", 8)
-	if err != nil {
-		return nil, fmt.Errorf("symbol 'etp_header_subtag_mask' not found: %v", err)
-	}
-
-	// "etp_heap_bits_subtag" is from:
-	// https://github.com/erlang/otp/blob/OTP-28.0.2/erts/emulator/beam/erl_etp.c#L108
-	_, etpHeapBitsSubtag, err := ef.SymbolData("etp_heap_bits_subtag", 8)
-	if err != nil {
-		return nil, fmt.Errorf("symbol 'etp_heap_bits_subtag' not found: %v", err)
-	}
-
 	// "beam_normal_exit" symbol is from:
 	// https://github.com/erlang/otp/blob/OTP-27.2.4/erts/emulator/beam/jit/beam_jit_main.cpp#L54
 	beamNormalExit, _, err := ef.SymbolData("beam_normal_exit", 8)
@@ -216,15 +203,32 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	}
 
 	d := &beamData{
-		otpRelease:          uint8(otpRelease),
-		ertsVersion:         string(ertsVersion[:len(ertsVersion)-1]),
-		theActiveCodeIndex:  libpf.Address(codeIndex.Address),
-		r:                   libpf.Address(r.Address),
-		beamNormalExit:      libpf.Address(beamNormalExit.Address),
-		ertsAtomTable:       uint64(atomTable.Address),
-		etpPtrMask:          npsr.Uint64(etpPtrMask, 0),
-		etpHeaderSubtagMask: npsr.Uint64(etpHeaderSubtagMask, 0),
-		etpHeapBitsSubtag:   npsr.Uint64(etpHeapBitsSubtag, 0),
+		otpRelease:         uint8(otpRelease),
+		ertsVersion:        string(ertsVersion[:len(ertsVersion)-1]),
+		theActiveCodeIndex: libpf.Address(codeIndex.Address),
+		r:                  libpf.Address(r.Address),
+		beamNormalExit:     libpf.Address(beamNormalExit.Address),
+		ertsAtomTable:      uint64(atomTable.Address),
+		etpPtrMask:         npsr.Uint64(etpPtrMask, 0),
+	}
+
+	if otpRelease >= 28 {
+		// "etp_header_subtag_mask" is from:
+		// https://github.com/erlang/otp/blob/OTP-28.0.2/erts/emulator/beam/erl_etp.c#L132
+		_, etpHeaderSubtagMask, err := ef.SymbolData("etp_header_subtag_mask", 8)
+		if err != nil {
+			return nil, fmt.Errorf("symbol 'etp_header_subtag_mask' not found: %v", err)
+		}
+
+		// "etp_heap_bits_subtag" is from:
+		// https://github.com/erlang/otp/blob/OTP-28.0.2/erts/emulator/beam/erl_etp.c#L108
+		_, etpHeapBitsSubtag, err := ef.SymbolData("etp_heap_bits_subtag", 8)
+		if err != nil {
+			return nil, fmt.Errorf("symbol 'etp_heap_bits_subtag' not found: %v", err)
+		}
+
+		d.etpHeaderSubtagMask = npsr.Uint64(etpHeaderSubtagMask, 0)
+		d.etpHeapBitsSubtag = npsr.Uint64(etpHeapBitsSubtag, 0)
 	}
 
 	// If erts_frame_layout is not defined, it means that frame pointers are not supported,
@@ -258,7 +262,7 @@ func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	vms.erlHeapBits.data = 16
 
 	switch d.otpRelease {
-	case 27:
+	case 25, 26, 27:
 		vms.beamCodeHeader.sizeOf = 144
 		vms.beamCodeHeader.functions = 136
 		vms.atom.name = 32
@@ -322,36 +326,64 @@ func (d *beamData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 	}
 
 	return &beamInstance{
-		pid:          pid,
-		data:         d,
-		rm:           rm,
-		prefixes:     make(map[lpm.Prefix]uint32),
-		rangesPtr:    bias + libpf.Address(d.r),
-		atomTable:    bias + libpf.Address(d.ertsAtomTable),
-		atomCache:    atomCache,
-		mfaNameCache: mfaNameCache,
-		stringCache:  stringCache,
+		pid:                pid,
+		data:               d,
+		rm:                 rm,
+		activeCodeIndexPtr: bias + libpf.Address(d.theActiveCodeIndex),
+		prefixes:           make(map[lpm.Prefix]uint32),
+		rangesPtr:          bias + libpf.Address(d.r),
+		atomTable:          bias + libpf.Address(d.ertsAtomTable),
+		atomCache:          atomCache,
+		mfaNameCache:       mfaNameCache,
+		stringCache:        stringCache,
 	}, nil
 }
 
 func (d *beamData) Unload(_ interpreter.EbpfHandler) {
 }
 
+func (i *beamInstance) readActiveRanges() (modules libpf.Address, n uint64, err error) {
+	activeCodeIndex := i.rm.Uint32(i.activeCodeIndexPtr)
+	activeRanges := i.rangesPtr + libpf.Address(uint64(i.data.vmStructs.ranges.sizeOf)*uint64(activeCodeIndex))
+
+	var rangesInfo [16]byte
+	if err := i.rm.Read(activeRanges, rangesInfo[:]); err != nil {
+		return 0, 0, fmt.Errorf("BEAM failed to read active ranges: %w", err)
+	}
+
+	modules = npsr.Ptr(rangesInfo[:], 0)
+	n = npsr.Uint64(rangesInfo[:], 8)
+	if modules == 0 || n == 0 {
+		return 0, 0, fmt.Errorf("BEAM active ranges are empty")
+	}
+
+	return modules, n, nil
+}
+
 func (i *beamInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler, _ reporter.ExecutableReporter, pr process.Process, mappings []process.Mapping) error {
 	pid := pr.PID()
 	i.mappingGeneration++
-	for idx := range mappings {
-		m := &mappings[idx]
-		if !m.IsExecutable() || !m.IsAnonymous() {
+	modules, n, err := i.readActiveRanges()
+	if err != nil {
+		return err
+	}
+
+	var rangeEntry [16]byte
+	for idx := uint64(0); idx < n; idx++ {
+		if err := i.rm.Read(modules+libpf.Address(idx*16), rangeEntry[:]); err != nil {
+			return fmt.Errorf("BEAM failed to read module range %d: %w", idx, err)
+		}
+		start := npsr.Ptr(rangeEntry[:], 0)
+		end := npsr.Ptr(rangeEntry[:], 8)
+		if start == 0 || end <= start {
 			continue
 		}
 
-		// Just assume all anonymous and executable mappings are BEAM for now
-		log.Debugf("Enabling BEAM for %#x/%#x", m.Vaddr, m.Length)
+		log.Debugf("Enabling BEAM for %#x/%#x", start, end-start)
 
-		prefixes, err := lpm.CalculatePrefixList(m.Vaddr, m.Vaddr+m.Length)
+		prefixes, err := lpm.CalculatePrefixList(uint64(start), uint64(end))
 		if err != nil {
-			return fmt.Errorf("new anonymous mapping lpm failure %#x/%#x", m.Vaddr, m.Length)
+			return fmt.Errorf("new BEAM mapping lpm failure %#x/%#x", start, end-start)
 		}
 
 		for _, prefix := range prefixes {
@@ -492,9 +524,10 @@ func (i *beamInstance) findFileLocation(codeHeader libpf.Address, functionIndex 
 
 	lineTable := i.rm.Ptr(codeHeader + libpf.Address(vms.beamCodeHeader.lineTable))
 	functionTable := lineTable + libpf.Address(vms.beamCodeLineTab.funcTab)
+	functionEntryStart := functionTable + libpf.Address(8*functionIndex)
 
 	lineRange := make([]byte, 16)
-	err = i.rm.Read(functionTable+libpf.Address(8*functionIndex), lineRange)
+	err = i.rm.Read(functionEntryStart, lineRange)
 	if err != nil {
 		return libpf.NullString, 0, fmt.Errorf("BEAM failed to read function table info")
 	}
@@ -545,7 +578,34 @@ func (i *beamInstance) findFileLocation(codeHeader libpf.Address, functionIndex 
 		}
 	}
 
-	return libpf.NullString, 0, fmt.Errorf("BEAM unable to find file and line number")
+	// If the PC is beyond the last line-table entry, use the last valid entry as a best effort.
+	var lastLinePtr libpf.Address
+	if lineLow > functionEntryStart {
+		lastLinePtr = lineLow - 8
+	} else {
+		lastLinePtr = functionEntryStart
+	}
+
+	locIndex := uint32((lastLinePtr - i.rm.Ptr(functionTable)) / 8)
+	lineTab := make([]byte, vms.beamCodeLineTab.sizeOf)
+	if err = i.rm.Read(lineTable, lineTab); err != nil {
+		return libpf.NullString, 0, fmt.Errorf("BEAM failed to read line table info")
+	}
+	locSize := npsr.Uint32(lineTab, uint(vms.beamCodeLineTab.locSize))
+	locTab := npsr.Ptr(lineTab, uint(vms.beamCodeLineTab.locTab))
+	locAddr := locTab + libpf.Address(locSize*locIndex)
+
+	loc := uint64(0)
+	if locSize == 2 {
+		loc = uint64(i.rm.Uint16(locAddr))
+	} else {
+		loc = uint64(i.rm.Uint32(locAddr))
+	}
+	fnameIndex := loc >> 24
+	fileNamePtr := i.rm.Ptr(lineTable) + libpf.Address(8*fnameIndex)
+	fileName = i.readErlangString(i.rm.Ptr(fileNamePtr), 256)
+
+	return fileName, loc & ((1 << 24) - 1), nil
 }
 
 func (i *beamInstance) lookupAtom(index uint32) (libpf.String, error) {
@@ -563,11 +623,6 @@ func (i *beamInstance) lookupAtom(index uint32) (libpf.String, error) {
 
 	name := make([]byte, len)
 	switch i.data.otpRelease {
-	case 27:
-		err := i.rm.Read(i.rm.Ptr(entry+libpf.Address(vms.atom.name)), name)
-		if err != nil {
-			return libpf.NullString, fmt.Errorf("BEAM Unable to lookup atom with index %d: %v", index, err)
-		}
 	case 28:
 		// Implementation based on https://github.com/erlang/otp/blob/OTP-28.0.2/erts/etc/unix/etp-commands.in#L657-L674
 		unboxed := i.rm.Ptr(entry+libpf.Address(vms.atom.u.bin)) & libpf.Address(i.data.etpPtrMask)
@@ -580,6 +635,11 @@ func (i *beamInstance) lookupAtom(index uint32) (libpf.String, error) {
 			}
 		} else {
 			return libpf.NullString, fmt.Errorf("BEAM Unable to lookup atom with index %d: expected boxed value subtag 0x%x, found 0x%x", index, i.data.etpHeapBitsSubtag, subtag)
+		}
+	default:
+		err := i.rm.Read(i.rm.Ptr(entry+libpf.Address(vms.atom.name)), name)
+		if err != nil {
+			return libpf.NullString, fmt.Errorf("BEAM Unable to lookup atom with index %d: %v", index, err)
 		}
 	}
 
