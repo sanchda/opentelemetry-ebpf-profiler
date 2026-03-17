@@ -61,6 +61,8 @@ const (
 	errorBit = 0x80
 
 	abortFrame = errorBit | UnknownFrame
+	// AbortFrame preserves the older exported name expected by downstream consumers.
+	AbortFrame FrameType = abortFrame
 )
 
 func FrameTypeFromString(name string) FrameType {
